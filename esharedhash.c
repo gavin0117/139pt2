@@ -132,7 +132,7 @@ __thread int pool_initialized = 0;
 void *global_heap_base = NULL;
 atomic_int next_thread_id = 0;
 
-#define THREAD_POOL_SIZE (16 * 1024)  /* 16KB per thread */
+#define THREAD_POOL_SIZE (4 * 1024)   /* 4KB pool per thread */
 
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  * Memory Allocator Initialization
@@ -189,13 +189,13 @@ void thread_pool_init(void) {
         return;
     }
 
-    /* Allocate a fixed-size chunk from the global allocator for this thread's pool */
+    /* Allocate tiny pool from global allocator - most work goes to global */
     pthread_mutex_lock(&mLockThread);
     pool_start = (char *)_umalloc(THREAD_POOL_SIZE);
     pthread_mutex_unlock(&mLockThread);
 
     if (!pool_start) {
-        /* Failed to allocate pool, will fall back to global allocator */
+        /* Failed to allocate pool, fall back to global allocator only */
         pool_initialized = 1;
         return;
     }
@@ -399,9 +399,20 @@ void ufree(void *ptr) {
         return;
     }
 
-    /* Thread mode: skip freeing since we use bump allocator */
+    /* Thread mode: check if from pool or global allocator */
     if (use_multithread) {
-        /* No-op for thread mode - memory is reclaimed when program exits */
+        /* Check if pointer is within our thread pool range */
+        if (pool_initialized && pool_start &&
+            ptr >= (void *)pool_start && ptr < (void *)(pool_start + pool_size)) {
+            /* From thread pool - no-op (bump allocator doesn't support free) */
+            return;
+        }
+
+        /* From global allocator - need to free it */
+        atomic_fetch_add(&lock_count, 1);
+        pthread_mutex_lock(&mLockThread);
+        _ufree(ptr);
+        pthread_mutex_unlock(&mLockThread);
         return;
     }
 
