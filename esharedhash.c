@@ -132,7 +132,7 @@ __thread int pool_initialized = 0;
 void *global_heap_base = NULL;
 atomic_int next_thread_id = 0;
 
-#define THREAD_POOL_SIZE 128          /* Tiny 128B pool - most allocations use global */
+#define THREAD_POOL_SIZE (2 * 1024)   /* 2KB pool per thread */
 
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  * Memory Allocator Initialization
