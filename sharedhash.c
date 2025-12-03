@@ -131,26 +131,7 @@ int use_multithread = 0;  /* for thread mode */
  * region.
  */
 
-/* Thread-mode: use regular pointer since threads share address space */
-static node_t *free_list_thread = NULL;
-static void *thread_pool_base = NULL;  /* Track pool start for bounds checking */
-
 void *init_umem(void) {
-    /* Thread mode: use malloc() - threads naturally share memory */
-    if (use_multithread) {
-        void *base = malloc(UMEM_SIZE);
-        if (!base) {
-            perror("malloc");
-            exit(1);
-        }
-        thread_pool_base = base;
-        free_list_thread = (node_t *)base;
-        free_list_thread->size = UMEM_SIZE - sizeof(node_t);
-        free_list_thread->next = NULL;
-        return base;
-    }
-
-    /* Process mode: use mmap() for shared memory */
     free_list_ptr = mmap(NULL, sizeof(node_t *),
                          PROT_READ | PROT_WRITE,
                          MAP_SHARED | MAP_ANONYMOUS, -1, 0);
@@ -200,7 +181,7 @@ void *init_umem(void) {
  */
 
 static void coalesce(void) {
-    node_t *curr = use_multithread ? free_list_thread : *free_list_ptr;
+    node_t *curr = *free_list_ptr;
     while (curr && curr->next) {
         char *end = (char *)curr + sizeof(node_t) + ALIGN(curr->size);
         if (end == (char *)curr->next) {
@@ -238,7 +219,7 @@ void *_umalloc(size_t size) {
 
     size = ALIGN(size);
     node_t *prev = NULL;
-    node_t *curr = use_multithread ? free_list_thread : *free_list_ptr;
+    node_t *curr = *free_list_ptr;
 
     while (curr) {
         if (curr->size >= (long)size) {
@@ -255,23 +236,15 @@ void *_umalloc(size_t size) {
                 node_t *new_free = (node_t *)(alloc_start + sizeof(header_t) + size);
                 new_free->size = remaining - sizeof(node_t);
                 new_free->next = next_free;
-                if (prev) {
+                if (prev)
                     prev->next = new_free;
-                } else {
-                    if (use_multithread)
-                        free_list_thread = new_free;
-                    else
-                        *free_list_ptr = new_free;
-                }
+                else
+                    *free_list_ptr = new_free;
             } else {
-                if (prev) {
+                if (prev)
                     prev->next = next_free;
-                } else {
-                    if (use_multithread)
-                        free_list_thread = next_free;
-                    else
-                        *free_list_ptr = next_free;
-                }
+                else
+                    *free_list_ptr = next_free;
             }
 
             return user_ptr;
@@ -311,13 +284,11 @@ void _ufree(void *ptr) {
     node->size = ALIGN(hdr->size);
     node->next = NULL;
 
-    node_t **head = use_multithread ? &free_list_thread : free_list_ptr;
-
-    if (!*head || node < *head) {
-        node->next = *head;
-        *head = node;
+    if (!*free_list_ptr || node < *free_list_ptr) {
+        node->next = *free_list_ptr;
+        *free_list_ptr = node;
     } else {
-        node_t *curr = *head;
+        node_t *curr = *free_list_ptr;
         while (curr->next && curr->next < node)
             curr = curr->next;
         node->next = curr->next;
@@ -351,57 +322,30 @@ void *umalloc(size_t size) {
     } else if (use_multiprocess) {
         sem_wait(mLock);
     }
-
+    
     void* p = _umalloc(size);
-
+    
     if (use_multithread) {
         pthread_mutex_unlock(&mLockThread);
     } else if (use_multiprocess) {
         sem_post(mLock);
     }
-
-    /* Thread mode fallback: use system malloc if pool exhausted */
-    if (!p && use_multithread) {
-        size_t aligned_size = ALIGN(size);
-        void *mem = malloc(sizeof(header_t) + aligned_size);
-        if (!mem) return NULL;
-        header_t *hdr = (header_t *)mem;
-        hdr->size = aligned_size;
-        hdr->magic = MAGIC;
-        return (char *)mem + sizeof(header_t);
-    }
-
+    
     return p;
 }
 
 void ufree(void *ptr) {
-    if (!ptr) return;
-
-    /* Thread mode: check if from pool or malloc */
     if (use_multithread) {
-        header_t *hdr = (header_t *)((char *)ptr - sizeof(header_t));
-        /* Check if pointer is within the managed pool */
-        if (thread_pool_base && ptr >= thread_pool_base &&
-            ptr < (void *)((char *)thread_pool_base + UMEM_SIZE)) {
-            /* From pool - use _ufree with lock */
-            pthread_mutex_lock(&mLockThread);
-            _ufree(ptr);
-            pthread_mutex_unlock(&mLockThread);
-        } else {
-            /* From malloc - just free it */
-            free(hdr);
-        }
-        return;
-    }
-
-    /* Process mode: use _ufree with semaphore */
-    if (use_multiprocess) {
+        pthread_mutex_lock(&mLockThread);
+    } else if (use_multiprocess) {
         sem_wait(mLock);
     }
-
+    
     _ufree(ptr);
-
-    if (use_multiprocess) {
+    
+    if (use_multithread) {
+        pthread_mutex_unlock(&mLockThread);
+    } else if (use_multiprocess) {
         sem_post(mLock);
     }
 }
@@ -785,7 +729,7 @@ typedef struct {
 void *worker_thread(void *arg) {
     thread_arg_t *targ = (thread_arg_t *)arg;
     unsigned long h = process_block(targ->block_buf, targ->block_len);
-    free(targ->block_buf);  /* Buffer allocated with malloc() */
+    ufree(targ->block_buf);
     targ->results[targ->block_id] = h;
     return NULL;
 }
@@ -814,10 +758,9 @@ int run_threads(const char *filename) {
             return 1;
         }
 
-        /* Use regular malloc for buffers - threads share memory naturally */
-        unsigned char *block_buf = malloc(n);
+        unsigned char *block_buf = umalloc(n);
         if (!block_buf) {
-            fprintf(stderr, "malloc failed for block %d\n", num_blocks);
+            fprintf(stderr, "umalloc failed for block %d\n", num_blocks);
             fclose(fp);
             return 1;
         }
@@ -828,10 +771,10 @@ int run_threads(const char *filename) {
         thread_args[num_blocks].block_len = n;
         thread_args[num_blocks].results = results;
 
-        if (pthread_create(&threads[num_blocks], NULL, worker_thread,
+        if (pthread_create(&threads[num_blocks], NULL, worker_thread, 
                           &thread_args[num_blocks]) != 0) {
             perror("pthread_create");
-            free(block_buf);
+            ufree(block_buf);
             fclose(fp);
             return 1;
         }
