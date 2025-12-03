@@ -65,6 +65,8 @@
 
 void *umalloc(size_t size);
 void ufree(void *ptr);
+void *_umalloc(size_t size);
+void _ufree(void *ptr);
 unsigned long process_block(const unsigned char *buf, size_t len);
 int run_single(const char *filename);
 int run_multi(const char *filename);
@@ -121,6 +123,17 @@ int use_multithread = 0;  /* for thread mode */
 
 atomic_int lock_count = 0;
 
+/* Per-thread memory pool for reduced contention */
+__thread char *pool_start = NULL;
+__thread char *pool_current = NULL;
+__thread size_t pool_size = 0;
+__thread int pool_initialized = 0;
+
+void *global_heap_base = NULL;
+atomic_int next_thread_id = 0;
+
+#define THREAD_POOL_SIZE (16 * 1024)  /* 16KB per thread */
+
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  * Memory Allocator Initialization
  *
@@ -162,10 +175,34 @@ void *init_umem(void) {
         exit(1);
     }
 
+    global_heap_base = base;
+
     *free_list_ptr = (node_t *)base;
     (*free_list_ptr)->size = UMEM_SIZE - sizeof(node_t);
     (*free_list_ptr)->next = NULL;
     return base;
+}
+
+/* Initialize per-thread memory pool */
+void thread_pool_init(void) {
+    if (pool_initialized) {
+        return;
+    }
+
+    /* Allocate a fixed-size chunk from the global allocator for this thread's pool */
+    pthread_mutex_lock(&mLockThread);
+    pool_start = (char *)_umalloc(THREAD_POOL_SIZE);
+    pthread_mutex_unlock(&mLockThread);
+
+    if (!pool_start) {
+        /* Failed to allocate pool, will fall back to global allocator */
+        pool_initialized = 1;
+        return;
+    }
+
+    pool_current = pool_start;
+    pool_size = THREAD_POOL_SIZE;
+    pool_initialized = 1;
 }
 
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -320,18 +357,37 @@ void _ufree(void *ptr) {
  */
 
 void *umalloc(size_t size) {
+    if (size == 0) {
+        return NULL;
+    }
+
+    /* Thread mode: use per-thread pool */
     if (use_multithread) {
+        size_t aligned_size = ALIGN(size);
+
+        /* Try to allocate from thread-local pool */
+        if (pool_initialized && pool_current + aligned_size <= pool_start + pool_size) {
+            void *ptr = pool_current;
+            pool_current += aligned_size;
+            return ptr;
+        }
+
+        /* Fall back to global allocator if pool exhausted */
         atomic_fetch_add(&lock_count, 1);
         pthread_mutex_lock(&mLockThread);
-    } else if (use_multiprocess) {
+        void *p = _umalloc(size);
+        pthread_mutex_unlock(&mLockThread);
+        return p;
+    }
+
+    /* Process mode: use global allocator with semaphore */
+    if (use_multiprocess) {
         sem_wait(mLock);
     }
 
     void* p = _umalloc(size);
 
-    if (use_multithread) {
-        pthread_mutex_unlock(&mLockThread);
-    } else if (use_multiprocess) {
+    if (use_multiprocess) {
         sem_post(mLock);
     }
 
@@ -339,18 +395,24 @@ void *umalloc(size_t size) {
 }
 
 void ufree(void *ptr) {
+    if (!ptr) {
+        return;
+    }
+
+    /* Thread mode: skip freeing since we use bump allocator */
     if (use_multithread) {
-        atomic_fetch_add(&lock_count, 1);
-        pthread_mutex_lock(&mLockThread);
-    } else if (use_multiprocess) {
+        /* No-op for thread mode - memory is reclaimed when program exits */
+        return;
+    }
+
+    /* Process mode: use global allocator */
+    if (use_multiprocess) {
         sem_wait(mLock);
     }
 
     _ufree(ptr);
 
-    if (use_multithread) {
-        pthread_mutex_unlock(&mLockThread);
-    } else if (use_multiprocess) {
+    if (use_multiprocess) {
         sem_post(mLock);
     }
 }
@@ -733,6 +795,10 @@ typedef struct {
 
 void *worker_thread(void *arg) {
     thread_arg_t *targ = (thread_arg_t *)arg;
+
+    /* Initialize per-thread memory pool */
+    thread_pool_init();
+
     unsigned long h = process_block(targ->block_buf, targ->block_len);
     ufree(targ->block_buf);
     targ->results[targ->block_id] = h;
