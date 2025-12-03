@@ -1,0 +1,7 @@
+# Compiled binaries
+sharedhash
+esharedhash
+
+# Test files
+*.bin
+test_*
