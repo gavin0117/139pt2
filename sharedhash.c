@@ -56,7 +56,6 @@
 #include <sys/wait.h>
 #include <semaphore.h>
 #include <pthread.h>
-#include <stdatomic.h>
 
 #define BLOCK_SIZE 1024
 #define SYMBOLS 256
@@ -118,8 +117,6 @@ sem_t* mLock;
 pthread_mutex_t mLockThread = PTHREAD_MUTEX_INITIALIZER;  /* for thread mode */
 int use_multiprocess = 0;
 int use_multithread = 0;  /* for thread mode */
-
-atomic_int lock_count = 0;
 
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  * Memory Allocator Initialization
@@ -321,33 +318,31 @@ void _ufree(void *ptr) {
 
 void *umalloc(size_t size) {
     if (use_multithread) {
-        atomic_fetch_add(&lock_count, 1);
         pthread_mutex_lock(&mLockThread);
     } else if (use_multiprocess) {
         sem_wait(mLock);
     }
-
+    
     void* p = _umalloc(size);
-
+    
     if (use_multithread) {
         pthread_mutex_unlock(&mLockThread);
     } else if (use_multiprocess) {
         sem_post(mLock);
     }
-
+    
     return p;
 }
 
 void ufree(void *ptr) {
     if (use_multithread) {
-        atomic_fetch_add(&lock_count, 1);
         pthread_mutex_lock(&mLockThread);
     } else if (use_multiprocess) {
         sem_wait(mLock);
     }
-
+    
     _ufree(ptr);
-
+    
     if (use_multithread) {
         pthread_mutex_unlock(&mLockThread);
     } else if (use_multiprocess) {
@@ -796,10 +791,5 @@ int run_threads(const char *filename) {
     }
 
     print_final(final_hash);
-
-    if (use_multithread) {
-        printf("Lock acquisitions: %d\n", atomic_load(&lock_count));
-    }
-
     return 0;
 }
