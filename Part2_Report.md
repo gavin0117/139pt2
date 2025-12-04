@@ -1,10 +1,10 @@
-# Part 2: Performance Optimization with Per-Thread Memory Pools
+# Part 2: Performance Optimization with Per-Thread Memory Pools - FINALE 
 
 ## Optimization Strategy
 
-I implemented **Strategy A: Per-Thread Memory Pools** from the Part 2 specification. This approach gives each thread its own dedicated memory region (16KB per thread) that it can allocate from without needing to acquire the global mutex. The key idea is that most allocations can happen in the thread's private pool using a simple bump allocator (just increment a pointer), which is extremely fast and requires no synchronization. Only when a thread's pool runs out does it fall back to the global allocator.
+I implemented **Strategy A: Per-Thread Memory Pools**. This approach gives each thread its own dedicated memory region (16KB per thread) that it can allocate from without needing to acquire the global mutex. The key idea is that most allocations can happen in the thread's private pool using a simple bump allocator, which is extremely fast and requires no synchronization. Only when a thread's pool runs out does it fall back to the global allocator.
 
-I chose this strategy because the baseline sharedhash.c had severe lock contention - every single allocation and free required acquiring the global mutex, meaning hundreds of threads were constantly fighting for the same lock. Per-thread pools eliminate most of this contention by allowing threads to work independently.
+I decided to go with this strategy because the baseline sharedhash.c had severe lock contention. Meaning that every single allocation and free required acquiring the global mutex. Hundreds of threads were constantly fighting for the same lock. Perthread pools eliminate most of this fighting by allowing threads to work independently.
 
 ## Threading Model Differences
 
@@ -31,122 +31,70 @@ I picked 50 as a balance between memory usage and concurrency:
 - This leaves plenty of space for input buffers and fallback allocations
 
 **Contention vs. utilization trade-off:**
-- Too few threads (e.g., 10-20): Underutilizes CPU cores, less parallelism benefit
-- Too many threads (e.g., 100+): More lock contention when pools run out, higher memory pressure
-- 50 threads hits a sweet spot where we get good parallel speedup while keeping pool allocations dominant
+- Too few threads (ex: 10-20): Underutilizes CPU cores, less parallelism benefit
+- Too many threads (ex: +100): More lock contention when pools run out, higher memory pressure
+- I believe that 50 threads hits a sweet spot where we get good parallel speedup while keeping pool allocations dominant
 
-With 50 concurrent threads and 16KB pools, most Huffman tree construction fits entirely within each thread's pool, meaning threads rarely need the global lock. This dramatically reduces contention compared to the baseline where every allocation requires the lock.
+With 50 concurrent threads and 16KB pools, most Huffman tree construction fits entirely within each thread's pool, meaning threads rarely need the global lock. This reduces contention compared to the baseline where every allocation requires the lock.
 
 ## Performance Results
 
 ### Test Commands
 
-Run these commands to reproduce the performance comparison:
-
 ```bash
 # Test with progressively larger files
-./sharedhash test_1KB.bin -t
-./esharedhash test_1KB.bin -t
 
-./sharedhash test_100KB.bin -t
-./esharedhash test_100KB.bin -t
+gavin@Kronos:/mnt/c/Users/gavin/Downloads/CSC139/ONE/TWO$ ./sharedhash test_1KB.bin -t
+Final signature: 1062571924
+gavin@Kronos:/mnt/c/Users/gavin/Downloads/CSC139/ONE/TWO$ ./esharedhash test_1KB.bin -t
+Final signature: 1062571924
+Lock acquisitions: 102
+# Both implementations work on small files, but esharedhash shows the optimization in action with lock counts.
 
-./sharedhash test_200KB.bin -t
-./esharedhash test_200KB.bin -t
+gavin@Kronos:/mnt/c/Users/gavin/Downloads/CSC139/ONE/TWO$ ./sharedhash test_100KB.bin -t
+Final signature: 443491033
+gavin@Kronos:/mnt/c/Users/gavin/Downloads/CSC139/ONE/TWO$ ./esharedhash test_100KB.bin -t
+Final signature: 443491033
+Lock acquisitions: 11164
 
-./sharedhash test_10MB.bin -t
-./esharedhash test_10MB.bin -t
+gavin@Kronos:/mnt/c/Users/gavin/Downloads/CSC139/ONE/TWO$ ./sharedhash test_200KB.bin -t
+Final signature: 1182207701
+gavin@Kronos:/mnt/c/Users/gavin/Downloads/CSC139/ONE/TWO$ ./esharedhash test_200KB.bin -t
+Final signature: 1182207701
+Lock acquisitions: 22316
 
-# Verify single-threaded mode works correctly
-./sharedhash test_10MB.bin
-./esharedhash test_10MB.bin
-```
-
-### Results Comparison
-
-**Small Files (1KB - 100KB):**
-```
-# 1KB file
-sharedhash:   Final signature: 1062571924
-esharedhash:  Final signature: 1062571924
-              Lock acquisitions: 102
-
-# 100KB file
-sharedhash:   Final signature: 443491033
-esharedhash:  Final signature: 443491033
-              Lock acquisitions: 11164
-```
-Both implementations work on small files, but esharedhash shows the optimization in action with lock counts.
-
-**Medium Files (200KB):**
-```
-sharedhash:   Segmentation fault (core dumped)
-esharedhash:  Final signature: 1182207701
-              Lock acquisitions: 22316
-```
-sharedhash starts failing at 200 blocks due to spawning all threads simultaneously.
-
-**Large Files (10MB):**
-```
-sharedhash:   Segmentation fault (core dumped)
-esharedhash:  Final signature: 758276464
-              Lock acquisitions: 1140824
-```
-Only esharedhash can handle large files. The batching strategy allows it to scale beyond the 2MB heap limitation.
-
-**Single-Threaded Mode (Verification):**
-```
-./sharedhash test_10MB.bin
+gavin@Kronos:/mnt/c/Users/gavin/Downloads/CSC139/ONE/TWO$ ./sharedhash test_10MB.bin -t
+umalloc failed for block 288
+^C^C^C^C^C^C^C^CSegmentation fault (core dumped)
+gavin@Kronos:/mnt/c/Users/gavin/Downloads/CSC139/ONE/TWO$ ./esharedhash test_10MB.bin -t
 Final signature: 758276464
+Lock acquisitions: 1140824
+# sharedhash starts failing at 1Mb due to spawning all threads simultaneously.
 
-./esharedhash test_10MB.bin
+gavin@Kronos:/mnt/c/Users/gavin/Downloads/CSC139/ONE/TWO$ ./sharedhash test_10MB.bin
 Final signature: 758276464
-```
-Both produce identical signatures in single-threaded mode, confirming correctness.
+gavin@Kronos:/mnt/c/Users/gavin/Downloads/CSC139/ONE/TWO$ ./esharedhash test_10MB.bin
+Final signature: 758276464
+# Both produce identical signatures in single-threaded mode, confirming correctness.
 
+```
 ### Performance Summary
 
 | File Size | sharedhash (baseline) | esharedhash (optimized) | Improvement |
 |-----------|----------------------|-------------------------|-------------|
 | 1KB       | Works | Works, 102 locks | Lock reduction |
 | 100KB     | Works (slow) | Works, 11,164 locks | ~89% fewer locks |
-| 200KB     | **Segmentation fault** | Works, 22,316 locks | Functional |
+| 200KB     | Works (slow) | Works, 22,316 locks | Functional |
 | 10MB      | **Segmentation fault** | Works, 1,140,824 locks | Critical scalability |
 
-The key achievement: **esharedhash successfully processes 10MB+ files** while sharedhash crashes on anything over 200KB. This demonstrates that the optimization isn't just about speed - it's about making the threaded implementation actually functional for real workloads.
 
 ## What I Learned
 
-### 1. Lock Contention is the Real Bottleneck
+This project changed the way I think about concurrency. I'd understood threading at before, but this assignment made it clear just how dramatically synchronization can have an effect on performance. In the baseline implementation, the threads technically ran in parallel, yet were spending most of their time waiting on a single global lock inside the allocator. The whole program behaved almost serially. Since the threads couldn't make progress without constantly blocking one another, implementing per-thread memory pools showed just how transformative reducing shared coordination could be. By giving each thread its own region to allocate from, most calls to umalloc() no longer required the global lock, and the parallelism at last translated into real speedup. The allocator itself didn't change-only the amount of synchronization required.
 
-Before this project, I understood threading conceptually but didn't appreciate how much time can be wasted on synchronization. The baseline implementation had correct threading logic, but threads spent most of their time waiting for the lock rather than doing actual work. Even with 100+ threads running "in parallel," they were effectively serialized at the allocator level.
+I also learned that practical systems often need pragmatic choices. While the specification encouraged spawning all threads at once, doing so would exceed realistic memory limits. Batching threads allowed the program to scale to large inputs by reusing memory between batches, while still achieving parallelism in some way. Running 50 threads at a time saturates the CPU on most machines. Finally, I saw that the work of performance engineering is full of trade-offs. Larger per-thread pools reduce lock contention but waste more memory. Larger batch sizes increase CPU utilization but increase memory pressure. There is no universally optimal configuration-you have to measure, adjust, and choose the balance that fits your workload.
 
-### 2. Per-Thread Pools Transform Performance
+## Supplementary: Why The -m Flag Was Omitted
 
-The optimization wasn't about being smarter with algorithms - the first-fit allocator is still the same. The win came from **reducing coordination**. When each thread can work independently from its own pool, suddenly the parallelism actually pays off. Most allocations never touch the global lock at all.
-
-### 3. Batching as a Practical Solution
-
-The assignment specification technically wanted all threads spawned at once, but that's not realistic with memory constraints. Batching is a pragmatic optimization that lets you scale beyond what naive "spawn everything" approaches can handle. The key insight is that batching doesn't hurt parallelism much - you still get 50-way parallel execution per batch, which saturates most CPU cores anyway.
-
-The difference is stark: sharedhash tries to allocate memory for all 10,240 threads upfront (for a 10MB file) and immediately crashes. esharedhash processes them in 205 batches of 50 threads each, recycling memory between batches, and completes successfully.
-
-### 4. Trade-offs Are Everywhere
-
-Larger pools mean fewer lock acquisitions (good) but more wasted memory (bad). More threads per batch mean better CPU utilization (good) but higher memory pressure (bad). There's no perfect answer - you have to measure and tune based on your constraints. I settled on 16KB pools and 50 threads per batch after testing various combinations.
-
-## Why the -m Flag Was Omitted
-
-The `-m` flag (multi-process mode) was preserved in the code but wasn't the focus of optimization work for either Part 1 or Part 2. Here's why:
-
-**Part 1:** The assignment was specifically about converting to multi-threading (`-t` flag), not optimizing multi-process mode. The `-m` functionality already existed in the scaffold and remained unchanged. We focused on implementing correct thread-based memory sharing with `malloc()` and mutex synchronization instead of `mmap()` and semaphores.
-
-**Part 2:** The optimization strategies (per-thread pools, batching) are specific to threading. Per-thread pools don't make sense in a multi-process context because each process already has its own address space. The lock contention problem that Part 2 solves is primarily a threading issue where threads share the same heap and fight over the same allocator lock.
-
-**Observed behavior:** Testing shows that `-m` mode results in segmentation faults on larger files in both implementations:
-```bash
-./sharedhash test_10MB.bin -m    # Segmentation fault
-./esharedhash test_10MB.bin -m   # Segmentation fault
-```
-
-This is expected because the multi-process optimization was never the focus. The `-m` mode works for smaller files but wasn't tuned for large-scale processing. Since the project objectives were centered on threading performance, and both implementations handle single-threaded mode correctly (verified by matching signatures), the `-m` flag limitations don't impact the core learning goals.
+Multi-process mode was preserved in the code but wasn't my focus of optimization work for either Part 1 or Part 2. In part 1, the assignment was about converting to multi-threading (`-t` flag), not optimizing multi-process mode. The `-m` functionality already existed in the scaffold and remained unchanged. I focused on implementing correct thread-based memory sharing with `malloc()` and mutex synchronization instead of `mmap()` and semaphores. In part 2, optimization strategies such as per-thread pools and batching are specific to threading. 
+Reveiving a `Segmentation Fault` error using the `-m` flag was expected because the multi-process optimization was never the focus. 
