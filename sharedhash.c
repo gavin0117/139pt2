@@ -97,7 +97,7 @@ typedef struct __node_t {
  * multiple children try to allocate/free simultaneously.
  */
 
-static node_t **free_list_ptr = NULL;
+static node_t *free_list = NULL;
 
 #define ALIGNMENT 16
 #define ALIGN(size) (((size) + (ALIGNMENT - 1)) & ~(ALIGNMENT - 1))
@@ -114,9 +114,9 @@ static node_t **free_list_ptr = NULL;
  */
 
 sem_t* mLock;
-pthread_mutex_t mLockThread = PTHREAD_MUTEX_INITIALIZER;  /* for thread mode */
+pthread_mutex_t mLockThread = PTHREAD_MUTEX_INITIALIZER;
 int use_multiprocess = 0;
-int use_multithread = 0;  /* for thread mode */
+int use_multithread = 0;
 
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  * Memory Allocator Initialization
@@ -132,13 +132,7 @@ int use_multithread = 0;  /* for thread mode */
  */
 
 void *init_umem(void) {
-    free_list_ptr = mmap(NULL, sizeof(node_t *),
-                         PROT_READ | PROT_WRITE,
-                         MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-    if (free_list_ptr == MAP_FAILED) {
-        perror("mmap free_list_ptr");
-        exit(1);
-    }
+    void *base;
 
     if (use_multiprocess) {
         mLock = mmap(NULL, sizeof(sem_t),
@@ -148,20 +142,26 @@ void *init_umem(void) {
             perror("mmap semaphore");
             exit(1);
         }
-        sem_init(mLock, 1, 1);  // pshared=1: shared between processes
+        sem_init(mLock, 1, 1);
+
+        base = mmap(NULL, UMEM_SIZE,
+                    PROT_READ | PROT_WRITE,
+                    MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        if (base == MAP_FAILED) {
+            perror("mmap");
+            exit(1);
+        }
+    } else {
+        base = malloc(UMEM_SIZE);
+        if (!base) {
+            perror("malloc");
+            exit(1);
+        }
     }
 
-    void *base = mmap(NULL, UMEM_SIZE,
-                      PROT_READ | PROT_WRITE,
-                      MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-    if (base == MAP_FAILED) {
-        perror("mmap");
-        exit(1);
-    }
-
-    *free_list_ptr = (node_t *)base;
-    (*free_list_ptr)->size = UMEM_SIZE - sizeof(node_t);
-    (*free_list_ptr)->next = NULL;
+    free_list = (node_t *)base;
+    free_list->size = UMEM_SIZE - sizeof(node_t);
+    free_list->next = NULL;
     return base;
 }
 
@@ -181,7 +181,7 @@ void *init_umem(void) {
  */
 
 static void coalesce(void) {
-    node_t *curr = *free_list_ptr;
+    node_t *curr = free_list;
     while (curr && curr->next) {
         char *end = (char *)curr + sizeof(node_t) + ALIGN(curr->size);
         if (end == (char *)curr->next) {
@@ -219,7 +219,7 @@ void *_umalloc(size_t size) {
 
     size = ALIGN(size);
     node_t *prev = NULL;
-    node_t *curr = *free_list_ptr;
+    node_t *curr = free_list;
 
     while (curr) {
         if (curr->size >= (long)size) {
@@ -239,12 +239,12 @@ void *_umalloc(size_t size) {
                 if (prev)
                     prev->next = new_free;
                 else
-                    *free_list_ptr = new_free;
+                    free_list = new_free;
             } else {
                 if (prev)
                     prev->next = next_free;
                 else
-                    *free_list_ptr = next_free;
+                    free_list = next_free;
             }
 
             return user_ptr;
@@ -284,11 +284,11 @@ void _ufree(void *ptr) {
     node->size = ALIGN(hdr->size);
     node->next = NULL;
 
-    if (!*free_list_ptr || node < *free_list_ptr) {
-        node->next = *free_list_ptr;
-        *free_list_ptr = node;
+    if (!free_list || node < free_list) {
+        node->next = free_list;
+        free_list = node;
     } else {
-        node_t *curr = *free_list_ptr;
+        node_t *curr = free_list;
         while (curr->next && curr->next < node)
             curr = curr->next;
         node->next = curr->next;
@@ -743,56 +743,53 @@ int run_threads(const char *filename) {
 
     unsigned char buf[BLOCK_SIZE];
     unsigned long final_hash = 0;
-    int total_blocks = 0;
-
-    /* Process file in batches to limit concurrent threads */
-    #define BATCH_SIZE 20
-    pthread_t threads[BATCH_SIZE];
-    thread_arg_t thread_args[BATCH_SIZE];
-    unsigned long results[BATCH_SIZE];
+    pthread_t threads[1024];
+    thread_arg_t thread_args[1024];
+    unsigned long results[1024];
+    int num_blocks = 0;
 
     while (!feof(fp)) {
-        int batch_count = 0;
+        size_t n = fread(buf, 1, BLOCK_SIZE, fp);
+        if (n == 0) break;
 
-        /* Create a batch of threads */
-        while (batch_count < BATCH_SIZE && !feof(fp)) {
-            size_t n = fread(buf, 1, BLOCK_SIZE, fp);
-            if (n == 0) break;
-
-            unsigned char *block_buf = umalloc(n);
-            if (!block_buf) {
-                fprintf(stderr, "umalloc failed for block %d\n", total_blocks);
-                fclose(fp);
-                return 1;
-            }
-            memcpy(block_buf, buf, n);
-
-            thread_args[batch_count].block_id = batch_count;
-            thread_args[batch_count].block_buf = block_buf;
-            thread_args[batch_count].block_len = n;
-            thread_args[batch_count].results = results;
-
-            if (pthread_create(&threads[batch_count], NULL, worker_thread,
-                              &thread_args[batch_count]) != 0) {
-                perror("pthread_create");
-                ufree(block_buf);
-                fclose(fp);
-                return 1;
-            }
-
-            batch_count++;
-            total_blocks++;
+        if (num_blocks >= 1024) {
+            fprintf(stderr, "Error: file too large (max 1024 blocks)\n");
+            fclose(fp);
+            return 1;
         }
 
-        /* Wait for batch to complete and collect results */
-        for (int i = 0; i < batch_count; i++) {
-            pthread_join(threads[i], NULL);
-            print_intermediate(total_blocks - batch_count + i, results[i], 0);
-            final_hash = (final_hash + results[i]) % LARGE_PRIME;
+        unsigned char *block_buf = umalloc(n);
+        if (!block_buf) {
+            fprintf(stderr, "umalloc failed for block %d\n", num_blocks);
+            fclose(fp);
+            return 1;
         }
+        memcpy(block_buf, buf, n);
+
+        thread_args[num_blocks].block_id = num_blocks;
+        thread_args[num_blocks].block_buf = block_buf;
+        thread_args[num_blocks].block_len = n;
+        thread_args[num_blocks].results = results;
+
+        if (pthread_create(&threads[num_blocks], NULL, worker_thread,
+                          &thread_args[num_blocks]) != 0) {
+            perror("pthread_create");
+            ufree(block_buf);
+            fclose(fp);
+            return 1;
+        }
+
+        num_blocks++;
     }
 
     fclose(fp);
+
+    for (int i = 0; i < num_blocks; i++) {
+        pthread_join(threads[i], NULL);
+        print_intermediate(i, results[i], 0);
+        final_hash = (final_hash + results[i]) % LARGE_PRIME;
+    }
+
     print_final(final_hash);
     return 0;
 }
