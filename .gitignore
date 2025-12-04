@@ -1,6 +1,8 @@
 # Compiled binaries
 sharedhash
 esharedhash
+sharedhash_scaffold
+sharedhash_OG
 
 # Test files
 *.bin

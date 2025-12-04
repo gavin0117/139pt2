@@ -56,7 +56,6 @@
 #include <sys/wait.h>
 #include <semaphore.h>
 #include <pthread.h>
-#include <stdatomic.h>
 
 #define BLOCK_SIZE 1024
 #define SYMBOLS 256
@@ -98,7 +97,7 @@ typedef struct __node_t {
  * multiple children try to allocate/free simultaneously.
  */
 
-static node_t **free_list_ptr = NULL;
+static node_t *free_list = NULL;
 
 #define ALIGNMENT 16
 #define ALIGN(size) (((size) + (ALIGNMENT - 1)) & ~(ALIGNMENT - 1))
@@ -115,11 +114,9 @@ static node_t **free_list_ptr = NULL;
  */
 
 sem_t* mLock;
-pthread_mutex_t mLockThread = PTHREAD_MUTEX_INITIALIZER;  /* for thread mode */
+pthread_mutex_t mLockThread = PTHREAD_MUTEX_INITIALIZER;
 int use_multiprocess = 0;
-int use_multithread = 0;  /* for thread mode */
-
-atomic_int lock_count = 0;
+int use_multithread = 0;
 
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  * Memory Allocator Initialization
@@ -135,13 +132,7 @@ atomic_int lock_count = 0;
  */
 
 void *init_umem(void) {
-    free_list_ptr = mmap(NULL, sizeof(node_t *),
-                         PROT_READ | PROT_WRITE,
-                         MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-    if (free_list_ptr == MAP_FAILED) {
-        perror("mmap free_list_ptr");
-        exit(1);
-    }
+    void *base;
 
     if (use_multiprocess) {
         mLock = mmap(NULL, sizeof(sem_t),
@@ -151,20 +142,26 @@ void *init_umem(void) {
             perror("mmap semaphore");
             exit(1);
         }
-        sem_init(mLock, 1, 1);  // pshared=1: shared between processes
+        sem_init(mLock, 1, 1);
+
+        base = mmap(NULL, UMEM_SIZE,
+                    PROT_READ | PROT_WRITE,
+                    MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        if (base == MAP_FAILED) {
+            perror("mmap");
+            exit(1);
+        }
+    } else {
+        base = malloc(UMEM_SIZE);
+        if (!base) {
+            perror("malloc");
+            exit(1);
+        }
     }
 
-    void *base = mmap(NULL, UMEM_SIZE,
-                      PROT_READ | PROT_WRITE,
-                      MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-    if (base == MAP_FAILED) {
-        perror("mmap");
-        exit(1);
-    }
-
-    *free_list_ptr = (node_t *)base;
-    (*free_list_ptr)->size = UMEM_SIZE - sizeof(node_t);
-    (*free_list_ptr)->next = NULL;
+    free_list = (node_t *)base;
+    free_list->size = UMEM_SIZE - sizeof(node_t);
+    free_list->next = NULL;
     return base;
 }
 
@@ -184,7 +181,7 @@ void *init_umem(void) {
  */
 
 static void coalesce(void) {
-    node_t *curr = *free_list_ptr;
+    node_t *curr = free_list;
     while (curr && curr->next) {
         char *end = (char *)curr + sizeof(node_t) + ALIGN(curr->size);
         if (end == (char *)curr->next) {
@@ -222,7 +219,7 @@ void *_umalloc(size_t size) {
 
     size = ALIGN(size);
     node_t *prev = NULL;
-    node_t *curr = *free_list_ptr;
+    node_t *curr = free_list;
 
     while (curr) {
         if (curr->size >= (long)size) {
@@ -242,12 +239,12 @@ void *_umalloc(size_t size) {
                 if (prev)
                     prev->next = new_free;
                 else
-                    *free_list_ptr = new_free;
+                    free_list = new_free;
             } else {
                 if (prev)
                     prev->next = next_free;
                 else
-                    *free_list_ptr = next_free;
+                    free_list = next_free;
             }
 
             return user_ptr;
@@ -287,11 +284,11 @@ void _ufree(void *ptr) {
     node->size = ALIGN(hdr->size);
     node->next = NULL;
 
-    if (!*free_list_ptr || node < *free_list_ptr) {
-        node->next = *free_list_ptr;
-        *free_list_ptr = node;
+    if (!free_list || node < free_list) {
+        node->next = free_list;
+        free_list = node;
     } else {
-        node_t *curr = *free_list_ptr;
+        node_t *curr = free_list;
         while (curr->next && curr->next < node)
             curr = curr->next;
         node->next = curr->next;
@@ -321,33 +318,31 @@ void _ufree(void *ptr) {
 
 void *umalloc(size_t size) {
     if (use_multithread) {
-        atomic_fetch_add(&lock_count, 1);
         pthread_mutex_lock(&mLockThread);
     } else if (use_multiprocess) {
         sem_wait(mLock);
     }
-
+    
     void* p = _umalloc(size);
-
+    
     if (use_multithread) {
         pthread_mutex_unlock(&mLockThread);
     } else if (use_multiprocess) {
         sem_post(mLock);
     }
-
+    
     return p;
 }
 
 void ufree(void *ptr) {
     if (use_multithread) {
-        atomic_fetch_add(&lock_count, 1);
         pthread_mutex_lock(&mLockThread);
     } else if (use_multiprocess) {
         sem_wait(mLock);
     }
-
+    
     _ufree(ptr);
-
+    
     if (use_multithread) {
         pthread_mutex_unlock(&mLockThread);
     } else if (use_multiprocess) {
@@ -776,7 +771,7 @@ int run_threads(const char *filename) {
         thread_args[num_blocks].block_len = n;
         thread_args[num_blocks].results = results;
 
-        if (pthread_create(&threads[num_blocks], NULL, worker_thread, 
+        if (pthread_create(&threads[num_blocks], NULL, worker_thread,
                           &thread_args[num_blocks]) != 0) {
             perror("pthread_create");
             ufree(block_buf);
@@ -796,10 +791,5 @@ int run_threads(const char *filename) {
     }
 
     print_final(final_hash);
-
-    if (use_multithread) {
-        printf("Lock acquisitions: %d\n", atomic_load(&lock_count));
-    }
-
     return 0;
 }

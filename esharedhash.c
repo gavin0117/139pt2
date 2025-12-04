@@ -65,8 +65,6 @@
 
 void *umalloc(size_t size);
 void ufree(void *ptr);
-void *_umalloc(size_t size);
-void _ufree(void *ptr);
 unsigned long process_block(const unsigned char *buf, size_t len);
 int run_single(const char *filename);
 int run_multi(const char *filename);
@@ -100,7 +98,7 @@ typedef struct __node_t {
  * multiple children try to allocate/free simultaneously.
  */
 
-static node_t **free_list_ptr = NULL;
+static node_t *free_list = NULL;
 
 #define ALIGNMENT 16
 #define ALIGN(size) (((size) + (ALIGNMENT - 1)) & ~(ALIGNMENT - 1))
@@ -117,22 +115,22 @@ static node_t **free_list_ptr = NULL;
  */
 
 sem_t* mLock;
-pthread_mutex_t mLockThread = PTHREAD_MUTEX_INITIALIZER;  /* for thread mode */
+pthread_mutex_t mLockThread = PTHREAD_MUTEX_INITIALIZER;
 int use_multiprocess = 0;
-int use_multithread = 0;  /* for thread mode */
+int use_multithread = 0;
 
-atomic_int lock_count = 0;
-
-/* Per-thread memory pool for reduced contention */
+/* Per-thread pool variables for Strategy A optimization */
 __thread char *pool_start = NULL;
 __thread char *pool_current = NULL;
 __thread size_t pool_size = 0;
 __thread int pool_initialized = 0;
 
 void *global_heap_base = NULL;
-atomic_int next_thread_id = 0;
+atomic_int next_pool_id = 0;
+atomic_int lock_count = 0;
 
-#define THREAD_POOL_SIZE (4 * 1024)   /* 4KB pool per thread */
+#define THREAD_POOL_SIZE (16 * 1024)  /* 16KB pool per thread */
+#define MAX_POOLS 50                  /* Max concurrent thread pools */
 
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  * Memory Allocator Initialization
@@ -148,13 +146,7 @@ atomic_int next_thread_id = 0;
  */
 
 void *init_umem(void) {
-    free_list_ptr = mmap(NULL, sizeof(node_t *),
-                         PROT_READ | PROT_WRITE,
-                         MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-    if (free_list_ptr == MAP_FAILED) {
-        perror("mmap free_list_ptr");
-        exit(1);
-    }
+    void *base;
 
     if (use_multiprocess) {
         mLock = mmap(NULL, sizeof(sem_t),
@@ -164,42 +156,50 @@ void *init_umem(void) {
             perror("mmap semaphore");
             exit(1);
         }
-        sem_init(mLock, 1, 1);  // pshared=1: shared between processes
-    }
+        sem_init(mLock, 1, 1);
 
-    void *base = mmap(NULL, UMEM_SIZE,
-                      PROT_READ | PROT_WRITE,
-                      MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-    if (base == MAP_FAILED) {
-        perror("mmap");
-        exit(1);
+        base = mmap(NULL, UMEM_SIZE,
+                    PROT_READ | PROT_WRITE,
+                    MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        if (base == MAP_FAILED) {
+            perror("mmap");
+            exit(1);
+        }
+    } else {
+        base = malloc(UMEM_SIZE);
+        if (!base) {
+            perror("malloc");
+            exit(1);
+        }
     }
 
     global_heap_base = base;
 
-    *free_list_ptr = (node_t *)base;
-    (*free_list_ptr)->size = UMEM_SIZE - sizeof(node_t);
-    (*free_list_ptr)->next = NULL;
+    if (use_multithread) {
+        size_t pools_reserved = MAX_POOLS * THREAD_POOL_SIZE;
+        char *allocator_start = (char *)base + pools_reserved;
+        free_list = (node_t *)allocator_start;
+        free_list->size = UMEM_SIZE - pools_reserved - sizeof(node_t);
+        free_list->next = NULL;
+    } else {
+        free_list = (node_t *)base;
+        free_list->size = UMEM_SIZE - sizeof(node_t);
+        free_list->next = NULL;
+    }
+
     return base;
 }
 
-/* Initialize per-thread memory pool */
 void thread_pool_init(void) {
-    if (pool_initialized) {
-        return;
-    }
+    if (pool_initialized) return;
 
-    /* Allocate tiny pool from global allocator - most work goes to global */
-    pthread_mutex_lock(&mLockThread);
-    pool_start = (char *)_umalloc(THREAD_POOL_SIZE);
-    pthread_mutex_unlock(&mLockThread);
-
-    if (!pool_start) {
-        /* Failed to allocate pool, fall back to global allocator only */
+    int pool_id = atomic_fetch_add(&next_pool_id, 1);
+    if (pool_id >= MAX_POOLS) {
         pool_initialized = 1;
         return;
     }
 
+    pool_start = (char *)global_heap_base + (pool_id * THREAD_POOL_SIZE);
     pool_current = pool_start;
     pool_size = THREAD_POOL_SIZE;
     pool_initialized = 1;
@@ -221,7 +221,7 @@ void thread_pool_init(void) {
  */
 
 static void coalesce(void) {
-    node_t *curr = *free_list_ptr;
+    node_t *curr = free_list;
     while (curr && curr->next) {
         char *end = (char *)curr + sizeof(node_t) + ALIGN(curr->size);
         if (end == (char *)curr->next) {
@@ -259,7 +259,7 @@ void *_umalloc(size_t size) {
 
     size = ALIGN(size);
     node_t *prev = NULL;
-    node_t *curr = *free_list_ptr;
+    node_t *curr = free_list;
 
     while (curr) {
         if (curr->size >= (long)size) {
@@ -279,12 +279,12 @@ void *_umalloc(size_t size) {
                 if (prev)
                     prev->next = new_free;
                 else
-                    *free_list_ptr = new_free;
+                    free_list = new_free;
             } else {
                 if (prev)
                     prev->next = next_free;
                 else
-                    *free_list_ptr = next_free;
+                    free_list = next_free;
             }
 
             return user_ptr;
@@ -324,11 +324,11 @@ void _ufree(void *ptr) {
     node->size = ALIGN(hdr->size);
     node->next = NULL;
 
-    if (!*free_list_ptr || node < *free_list_ptr) {
-        node->next = *free_list_ptr;
-        *free_list_ptr = node;
+    if (!free_list || node < free_list) {
+        node->next = free_list;
+        free_list = node;
     } else {
-        node_t *curr = *free_list_ptr;
+        node_t *curr = free_list;
         while (curr->next && curr->next < node)
             curr = curr->next;
         node->next = curr->next;
@@ -357,37 +357,29 @@ void _ufree(void *ptr) {
  */
 
 void *umalloc(size_t size) {
-    if (size == 0) {
-        return NULL;
-    }
+    if (size == 0) return NULL;
 
-    /* Thread mode: use per-thread pool */
-    if (use_multithread) {
+    if (use_multithread && pool_initialized && pool_start) {
         size_t aligned_size = ALIGN(size);
-
-        /* Try to allocate from thread-local pool */
-        if (pool_initialized && pool_current + aligned_size <= pool_start + pool_size) {
+        if (pool_current + aligned_size <= pool_start + pool_size) {
             void *ptr = pool_current;
             pool_current += aligned_size;
             return ptr;
         }
-
-        /* Fall back to global allocator if pool exhausted */
-        atomic_fetch_add(&lock_count, 1);
-        pthread_mutex_lock(&mLockThread);
-        void *p = _umalloc(size);
-        pthread_mutex_unlock(&mLockThread);
-        return p;
     }
 
-    /* Process mode: use global allocator with semaphore */
-    if (use_multiprocess) {
+    if (use_multithread) {
+        atomic_fetch_add(&lock_count, 1);
+        pthread_mutex_lock(&mLockThread);
+    } else if (use_multiprocess) {
         sem_wait(mLock);
     }
 
     void* p = _umalloc(size);
 
-    if (use_multiprocess) {
+    if (use_multithread) {
+        pthread_mutex_unlock(&mLockThread);
+    } else if (use_multiprocess) {
         sem_post(mLock);
     }
 
@@ -395,36 +387,24 @@ void *umalloc(size_t size) {
 }
 
 void ufree(void *ptr) {
-    if (!ptr) {
-        return;
-    }
+    if (!ptr) return;
 
-    /* Thread mode: check if from pool or global allocator */
     if (use_multithread) {
-        /* Check if pointer is within our thread pool range */
-        if (pool_initialized && pool_start &&
-            ptr >= (void *)pool_start && ptr < (void *)(pool_start + pool_size)) {
-            /* From thread pool - no-op (bump allocator doesn't support free) */
+        char *pools_end = (char *)global_heap_base + (MAX_POOLS * THREAD_POOL_SIZE);
+        if (ptr >= global_heap_base && ptr < (void *)pools_end) {
             return;
         }
 
-        /* From global allocator - need to free it */
         atomic_fetch_add(&lock_count, 1);
         pthread_mutex_lock(&mLockThread);
         _ufree(ptr);
         pthread_mutex_unlock(&mLockThread);
-        return;
-    }
-
-    /* Process mode: use global allocator */
-    if (use_multiprocess) {
+    } else if (use_multiprocess) {
         sem_wait(mLock);
-    }
-
-    _ufree(ptr);
-
-    if (use_multiprocess) {
+        _ufree(ptr);
         sem_post(mLock);
+    } else {
+        _ufree(ptr);
     }
 }
 
@@ -806,10 +786,7 @@ typedef struct {
 
 void *worker_thread(void *arg) {
     thread_arg_t *targ = (thread_arg_t *)arg;
-
-    /* Initialize per-thread memory pool */
     thread_pool_init();
-
     unsigned long h = process_block(targ->block_buf, targ->block_len);
     ufree(targ->block_buf);
     targ->results[targ->block_id] = h;
@@ -825,58 +802,55 @@ int run_threads(const char *filename) {
 
     unsigned char buf[BLOCK_SIZE];
     unsigned long final_hash = 0;
-    pthread_t threads[1024];
-    thread_arg_t thread_args[1024];
-    unsigned long results[1024];
-    int num_blocks = 0;
+    int total_blocks = 0;
+
+    #define BATCH_SIZE 50
+    pthread_t threads[BATCH_SIZE];
+    thread_arg_t thread_args[BATCH_SIZE];
+    unsigned long results[BATCH_SIZE];
 
     while (!feof(fp)) {
-        size_t n = fread(buf, 1, BLOCK_SIZE, fp);
-        if (n == 0) break;
+        int batch_count = 0;
+        atomic_store(&next_pool_id, 0);
 
-        if (num_blocks >= 1024) {
-            fprintf(stderr, "Error: file too large (max 1024 blocks)\n");
-            fclose(fp);
-            return 1;
+        while (batch_count < BATCH_SIZE && !feof(fp)) {
+            size_t n = fread(buf, 1, BLOCK_SIZE, fp);
+            if (n == 0) break;
+
+            unsigned char *block_buf = umalloc(n);
+            if (!block_buf) {
+                fprintf(stderr, "umalloc failed for block %d\n", total_blocks);
+                fclose(fp);
+                return 1;
+            }
+            memcpy(block_buf, buf, n);
+
+            thread_args[batch_count].block_id = batch_count;
+            thread_args[batch_count].block_buf = block_buf;
+            thread_args[batch_count].block_len = n;
+            thread_args[batch_count].results = results;
+
+            if (pthread_create(&threads[batch_count], NULL, worker_thread,
+                              &thread_args[batch_count]) != 0) {
+                perror("pthread_create");
+                ufree(block_buf);
+                fclose(fp);
+                return 1;
+            }
+
+            batch_count++;
+            total_blocks++;
         }
 
-        unsigned char *block_buf = umalloc(n);
-        if (!block_buf) {
-            fprintf(stderr, "umalloc failed for block %d\n", num_blocks);
-            fclose(fp);
-            return 1;
+        for (int i = 0; i < batch_count; i++) {
+            pthread_join(threads[i], NULL);
+            print_intermediate(total_blocks - batch_count + i, results[i], 0);
+            final_hash = (final_hash + results[i]) % LARGE_PRIME;
         }
-        memcpy(block_buf, buf, n);
-
-        thread_args[num_blocks].block_id = num_blocks;
-        thread_args[num_blocks].block_buf = block_buf;
-        thread_args[num_blocks].block_len = n;
-        thread_args[num_blocks].results = results;
-
-        if (pthread_create(&threads[num_blocks], NULL, worker_thread, 
-                          &thread_args[num_blocks]) != 0) {
-            perror("pthread_create");
-            ufree(block_buf);
-            fclose(fp);
-            return 1;
-        }
-
-        num_blocks++;
     }
 
     fclose(fp);
-
-    for (int i = 0; i < num_blocks; i++) {
-        pthread_join(threads[i], NULL);
-        print_intermediate(i, results[i], 0);
-        final_hash = (final_hash + results[i]) % LARGE_PRIME;
-    }
-
     print_final(final_hash);
-
-    if (use_multithread) {
-        printf("Lock acquisitions: %d\n", atomic_load(&lock_count));
-    }
-
+    fprintf(stderr, "Lock acquisitions: %d\n", atomic_load(&lock_count));
     return 0;
 }
