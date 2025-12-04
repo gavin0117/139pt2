@@ -743,53 +743,56 @@ int run_threads(const char *filename) {
 
     unsigned char buf[BLOCK_SIZE];
     unsigned long final_hash = 0;
-    pthread_t threads[1024];
-    thread_arg_t thread_args[1024];
-    unsigned long results[1024];
-    int num_blocks = 0;
+    int total_blocks = 0;
+
+    /* Process file in batches to limit concurrent threads */
+    #define BATCH_SIZE 20
+    pthread_t threads[BATCH_SIZE];
+    thread_arg_t thread_args[BATCH_SIZE];
+    unsigned long results[BATCH_SIZE];
 
     while (!feof(fp)) {
-        size_t n = fread(buf, 1, BLOCK_SIZE, fp);
-        if (n == 0) break;
+        int batch_count = 0;
 
-        if (num_blocks >= 1024) {
-            fprintf(stderr, "Error: file too large (max 1024 blocks)\n");
-            fclose(fp);
-            return 1;
+        /* Create a batch of threads */
+        while (batch_count < BATCH_SIZE && !feof(fp)) {
+            size_t n = fread(buf, 1, BLOCK_SIZE, fp);
+            if (n == 0) break;
+
+            unsigned char *block_buf = umalloc(n);
+            if (!block_buf) {
+                fprintf(stderr, "umalloc failed for block %d\n", total_blocks);
+                fclose(fp);
+                return 1;
+            }
+            memcpy(block_buf, buf, n);
+
+            thread_args[batch_count].block_id = batch_count;
+            thread_args[batch_count].block_buf = block_buf;
+            thread_args[batch_count].block_len = n;
+            thread_args[batch_count].results = results;
+
+            if (pthread_create(&threads[batch_count], NULL, worker_thread,
+                              &thread_args[batch_count]) != 0) {
+                perror("pthread_create");
+                ufree(block_buf);
+                fclose(fp);
+                return 1;
+            }
+
+            batch_count++;
+            total_blocks++;
         }
 
-        unsigned char *block_buf = umalloc(n);
-        if (!block_buf) {
-            fprintf(stderr, "umalloc failed for block %d\n", num_blocks);
-            fclose(fp);
-            return 1;
+        /* Wait for batch to complete and collect results */
+        for (int i = 0; i < batch_count; i++) {
+            pthread_join(threads[i], NULL);
+            print_intermediate(total_blocks - batch_count + i, results[i], 0);
+            final_hash = (final_hash + results[i]) % LARGE_PRIME;
         }
-        memcpy(block_buf, buf, n);
-
-        thread_args[num_blocks].block_id = num_blocks;
-        thread_args[num_blocks].block_buf = block_buf;
-        thread_args[num_blocks].block_len = n;
-        thread_args[num_blocks].results = results;
-
-        if (pthread_create(&threads[num_blocks], NULL, worker_thread, 
-                          &thread_args[num_blocks]) != 0) {
-            perror("pthread_create");
-            ufree(block_buf);
-            fclose(fp);
-            return 1;
-        }
-
-        num_blocks++;
     }
 
     fclose(fp);
-
-    for (int i = 0; i < num_blocks; i++) {
-        pthread_join(threads[i], NULL);
-        print_intermediate(i, results[i], 0);
-        final_hash = (final_hash + results[i]) % LARGE_PRIME;
-    }
-
     print_final(final_hash);
     return 0;
 }

@@ -71,6 +71,7 @@ unsigned long process_block(const unsigned char *buf, size_t len);
 int run_single(const char *filename);
 int run_multi(const char *filename);
 int run_threads(const char *filename);
+int run_threads(const char *filename);
 
 /* =======================================================================
    PROVIDED CODE — DO NOT MODIFY
@@ -117,13 +118,11 @@ static node_t **free_list_ptr = NULL;
  */
 
 sem_t* mLock;
-pthread_mutex_t mLockThread = PTHREAD_MUTEX_INITIALIZER;  /* for thread mode */
+pthread_mutex_t mLockThread = PTHREAD_MUTEX_INITIALIZER;
 int use_multiprocess = 0;
-int use_multithread = 0;  /* for thread mode */
+int use_multithread = 0;
 
-atomic_int lock_count = 0;
-
-/* Per-thread memory pool for reduced contention */
+/* Per-thread pool variables for Strategy A optimization */
 __thread char *pool_start = NULL;
 __thread char *pool_current = NULL;
 __thread size_t pool_size = 0;
@@ -131,11 +130,10 @@ __thread int pool_initialized = 0;
 
 void *global_heap_base = NULL;
 atomic_int next_thread_id = 0;
+atomic_int lock_count = 0;
 
-#define THREAD_POOL_SIZE (4 * 1024)   /* 4KB pool per thread */
-#define GLOBAL_RESERVE UMEM_SIZE      /* Use full heap for global allocator in thread mode */
-#define THREAD_POOL_OFFSET 0          /* No separate thread pool area */
-#define MAX_POOLS 0                   /* Disable thread pools - use global allocator only */
+#define THREAD_POOL_SIZE (32 * 1024) /* 32KB pool per thread */
+#define MAX_POOLS 20                 /* Only need pools for one batch (recycled between batches) */
 
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  * Memory Allocator Initialization
@@ -178,33 +176,41 @@ void *init_umem(void) {
         exit(1);
     }
 
+    /* Save global heap base for per-thread pool allocation */
     global_heap_base = base;
 
-    /* Use full heap for all modes */
-    *free_list_ptr = (node_t *)base;
-    (*free_list_ptr)->size = UMEM_SIZE - sizeof(node_t);
-    (*free_list_ptr)->next = NULL;
+    /* Reserve space for thread pools at the beginning of the heap */
+    size_t pools_reserved = MAX_POOLS * THREAD_POOL_SIZE;
+    char *allocator_start = (char *)base + pools_reserved;
 
+    *free_list_ptr = (node_t *)allocator_start;
+    (*free_list_ptr)->size = UMEM_SIZE - pools_reserved - sizeof(node_t);
+    (*free_list_ptr)->next = NULL;
     return base;
 }
 
-/* Initialize per-thread memory pool */
+/* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ * Per-Thread Pool Initialization (Strategy A Optimization)
+ *
+ * Each thread gets its own memory pool carved out from the reserved
+ * region at the beginning of the heap. Threads allocate from their
+ * pool using a simple bump allocator (no locking needed). When the
+ * pool runs out, we fall back to the global allocator with locking.
+ */
+
 void thread_pool_init(void) {
-    if (pool_initialized) {
+    if (pool_initialized) return;
+
+    int tid = atomic_fetch_add(&next_thread_id, 1);
+    if (tid >= MAX_POOLS) {
+        /* Too many threads, skip pool initialization and use global allocator */
+        pool_initialized = 1;
         return;
     }
 
-    /* Get unique thread ID and partition the heap space AFTER global allocator area */
-    int tid = atomic_fetch_add(&next_thread_id, 1);
-
-    /* Only first MAX_POOLS threads get dedicated pools, rest use global only */
-    if (tid < MAX_POOLS) {
-        pool_start = (char *)global_heap_base + THREAD_POOL_OFFSET + (tid * THREAD_POOL_SIZE);
-        pool_current = pool_start;
-        pool_size = THREAD_POOL_SIZE;
-    }
-    /* If no pool available, pool_start stays NULL - will always use global allocator */
-
+    pool_start = (char *)global_heap_base + (tid * THREAD_POOL_SIZE);
+    pool_current = pool_start;
+    pool_size = THREAD_POOL_SIZE;
     pool_initialized = 1;
 }
 
@@ -360,37 +366,31 @@ void _ufree(void *ptr) {
  */
 
 void *umalloc(size_t size) {
-    if (size == 0) {
-        return NULL;
-    }
+    if (size == 0) return NULL;
 
-    /* Thread mode: use per-thread pool */
-    if (use_multithread) {
+    /* Strategy A Optimization: Try per-thread pool first (no locking!) */
+    if (use_multithread && pool_initialized && pool_start) {
         size_t aligned_size = ALIGN(size);
-
-        /* Try to allocate from thread-local pool */
-        if (pool_initialized && pool_current + aligned_size <= pool_start + pool_size) {
+        if (pool_current + aligned_size <= pool_start + pool_size) {
             void *ptr = pool_current;
             pool_current += aligned_size;
             return ptr;
         }
-
-        /* Fall back to global allocator if pool exhausted */
-        atomic_fetch_add(&lock_count, 1);
-        pthread_mutex_lock(&mLockThread);
-        void *p = _umalloc(size);
-        pthread_mutex_unlock(&mLockThread);
-        return p;
     }
 
-    /* Process mode: use global allocator with semaphore */
-    if (use_multiprocess) {
+    /* Pool exhausted or not available, fall back to global allocator */
+    if (use_multithread) {
+        atomic_fetch_add(&lock_count, 1);
+        pthread_mutex_lock(&mLockThread);
+    } else if (use_multiprocess) {
         sem_wait(mLock);
     }
 
     void* p = _umalloc(size);
 
-    if (use_multiprocess) {
+    if (use_multithread) {
+        pthread_mutex_unlock(&mLockThread);
+    } else if (use_multiprocess) {
         sem_post(mLock);
     }
 
@@ -398,36 +398,28 @@ void *umalloc(size_t size) {
 }
 
 void ufree(void *ptr) {
-    if (!ptr) {
-        return;
-    }
+    if (!ptr) return;
 
-    /* Thread mode: check if from pool or global allocator */
+    /* Strategy A Optimization: Skip freeing pool allocations (bump allocator) */
     if (use_multithread) {
-        /* Check if pointer is within our thread pool range */
-        if (pool_initialized && pool_start &&
-            ptr >= (void *)pool_start && ptr < (void *)(pool_start + pool_size)) {
-            /* From thread pool - no-op (bump allocator doesn't support free) */
+        /* Check if this pointer is from the thread pool region */
+        char *pools_end = (char *)global_heap_base + (MAX_POOLS * THREAD_POOL_SIZE);
+        if (ptr >= global_heap_base && ptr < (void *)pools_end) {
+            /* Pointer is from a thread pool, no-op (pools don't support freeing) */
             return;
         }
 
-        /* From global allocator - need to free it */
+        /* Pointer is from global allocator, free it normally */
         atomic_fetch_add(&lock_count, 1);
         pthread_mutex_lock(&mLockThread);
         _ufree(ptr);
         pthread_mutex_unlock(&mLockThread);
-        return;
-    }
-
-    /* Process mode: use global allocator */
-    if (use_multiprocess) {
+    } else if (use_multiprocess) {
         sem_wait(mLock);
-    }
-
-    _ufree(ptr);
-
-    if (use_multiprocess) {
+        _ufree(ptr);
         sem_post(mLock);
+    } else {
+        _ufree(ptr);
     }
 }
 
@@ -810,7 +802,7 @@ typedef struct {
 void *worker_thread(void *arg) {
     thread_arg_t *targ = (thread_arg_t *)arg;
 
-    /* Initialize per-thread memory pool */
+    /* Initialize per-thread memory pool for Strategy A optimization */
     thread_pool_init();
 
     unsigned long h = process_block(targ->block_buf, targ->block_len);
@@ -828,58 +820,63 @@ int run_threads(const char *filename) {
 
     unsigned char buf[BLOCK_SIZE];
     unsigned long final_hash = 0;
-    pthread_t threads[1024];
-    thread_arg_t thread_args[1024];
-    unsigned long results[1024];
-    int num_blocks = 0;
+    int total_blocks = 0;
+
+    /* Process file in batches to limit concurrent threads */
+    #define BATCH_SIZE 20
+    pthread_t threads[BATCH_SIZE];
+    thread_arg_t thread_args[BATCH_SIZE];
+    unsigned long results[BATCH_SIZE];
 
     while (!feof(fp)) {
-        size_t n = fread(buf, 1, BLOCK_SIZE, fp);
-        if (n == 0) break;
+        int batch_count = 0;
 
-        if (num_blocks >= 1024) {
-            fprintf(stderr, "Error: file too large (max 1024 blocks)\n");
-            fclose(fp);
-            return 1;
+        /* Reset pool allocation counter for pool recycling between batches */
+        atomic_store(&next_thread_id, 0);
+
+        /* Create a batch of threads */
+        while (batch_count < BATCH_SIZE && !feof(fp)) {
+            size_t n = fread(buf, 1, BLOCK_SIZE, fp);
+            if (n == 0) break;
+
+            unsigned char *block_buf = umalloc(n);
+            if (!block_buf) {
+                fprintf(stderr, "umalloc failed for block %d\n", total_blocks);
+                fclose(fp);
+                return 1;
+            }
+            memcpy(block_buf, buf, n);
+
+            thread_args[batch_count].block_id = batch_count;
+            thread_args[batch_count].block_buf = block_buf;
+            thread_args[batch_count].block_len = n;
+            thread_args[batch_count].results = results;
+
+            if (pthread_create(&threads[batch_count], NULL, worker_thread,
+                              &thread_args[batch_count]) != 0) {
+                perror("pthread_create");
+                ufree(block_buf);
+                fclose(fp);
+                return 1;
+            }
+
+            batch_count++;
+            total_blocks++;
         }
 
-        unsigned char *block_buf = umalloc(n);
-        if (!block_buf) {
-            fprintf(stderr, "umalloc failed for block %d\n", num_blocks);
-            fclose(fp);
-            return 1;
+        /* Wait for batch to complete and collect results */
+        for (int i = 0; i < batch_count; i++) {
+            pthread_join(threads[i], NULL);
+            print_intermediate(total_blocks - batch_count + i, results[i], 0);
+            final_hash = (final_hash + results[i]) % LARGE_PRIME;
         }
-        memcpy(block_buf, buf, n);
-
-        thread_args[num_blocks].block_id = num_blocks;
-        thread_args[num_blocks].block_buf = block_buf;
-        thread_args[num_blocks].block_len = n;
-        thread_args[num_blocks].results = results;
-
-        if (pthread_create(&threads[num_blocks], NULL, worker_thread, 
-                          &thread_args[num_blocks]) != 0) {
-            perror("pthread_create");
-            ufree(block_buf);
-            fclose(fp);
-            return 1;
-        }
-
-        num_blocks++;
     }
 
     fclose(fp);
-
-    for (int i = 0; i < num_blocks; i++) {
-        pthread_join(threads[i], NULL);
-        print_intermediate(i, results[i], 0);
-        final_hash = (final_hash + results[i]) % LARGE_PRIME;
-    }
-
     print_final(final_hash);
 
-    if (use_multithread) {
-        printf("Lock acquisitions: %d\n", atomic_load(&lock_count));
-    }
+    /* Print lock acquisition count for performance analysis */
+    fprintf(stderr, "Lock acquisitions: %d\n", atomic_load(&lock_count));
 
     return 0;
 }
