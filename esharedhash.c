@@ -132,7 +132,10 @@ __thread int pool_initialized = 0;
 void *global_heap_base = NULL;
 atomic_int next_thread_id = 0;
 
-#define THREAD_POOL_SIZE (2 * 1024)   /* 2KB pool per thread */
+#define THREAD_POOL_SIZE (4 * 1024)   /* 4KB pool per thread */
+#define GLOBAL_RESERVE UMEM_SIZE      /* Use full heap for global allocator in thread mode */
+#define THREAD_POOL_OFFSET 0          /* No separate thread pool area */
+#define MAX_POOLS 0                   /* Disable thread pools - use global allocator only */
 
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  * Memory Allocator Initialization
@@ -177,9 +180,11 @@ void *init_umem(void) {
 
     global_heap_base = base;
 
+    /* Use full heap for all modes */
     *free_list_ptr = (node_t *)base;
     (*free_list_ptr)->size = UMEM_SIZE - sizeof(node_t);
     (*free_list_ptr)->next = NULL;
+
     return base;
 }
 
@@ -189,19 +194,17 @@ void thread_pool_init(void) {
         return;
     }
 
-    /* Allocate tiny pool from global allocator - most work goes to global */
-    pthread_mutex_lock(&mLockThread);
-    pool_start = (char *)_umalloc(THREAD_POOL_SIZE);
-    pthread_mutex_unlock(&mLockThread);
+    /* Get unique thread ID and partition the heap space AFTER global allocator area */
+    int tid = atomic_fetch_add(&next_thread_id, 1);
 
-    if (!pool_start) {
-        /* Failed to allocate pool, fall back to global allocator only */
-        pool_initialized = 1;
-        return;
+    /* Only first MAX_POOLS threads get dedicated pools, rest use global only */
+    if (tid < MAX_POOLS) {
+        pool_start = (char *)global_heap_base + THREAD_POOL_OFFSET + (tid * THREAD_POOL_SIZE);
+        pool_current = pool_start;
+        pool_size = THREAD_POOL_SIZE;
     }
+    /* If no pool available, pool_start stays NULL - will always use global allocator */
 
-    pool_current = pool_start;
-    pool_size = THREAD_POOL_SIZE;
     pool_initialized = 1;
 }
 
